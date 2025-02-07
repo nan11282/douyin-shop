@@ -1,0 +1,27 @@
+// auth.proto
+syntax = "proto3";
+
+package auth;
+
+option go_package = "douyin-shop/path";
+
+service AuthService {
+    rpc DeliverTokenByRPC (DeliverTokenReq) returns (DeliveryResp);
+    rpc VerifyTokenByRPC (VerifyTokenReq) returns (VerifyResp);
+}
+
+message DeliverTokenReq {
+    string user_id = 1;
+}
+
+message DeliveryResp {
+    string token = 1;
+}
+
+message VerifyTokenReq {
+    string token = 1;
+}
+
+message VerifyResp {
+    bool res = 1;
+}
