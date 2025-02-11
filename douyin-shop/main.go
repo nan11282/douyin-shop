@@ -2,64 +2,143 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"time"
+
+	pb "douyin-shop/path" // 请替换为实际的proto生成路径
 
 	"github.com/casbin/casbin/v2"
-	"github.com/casbin/casbin/v2/model"
-	fileadapter "github.com/casbin/casbin/v2/persist/file-adapter"
+	"github.com/cloudwego/hertz/pkg/app"
+	"github.com/cloudwego/hertz/pkg/app/server"
+	"github.com/golang-jwt/jwt/v4"
 	consulapi "github.com/hashicorp/consul/api"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
-// 初始化 CasBin
+type authService struct {
+	pb.UnimplementedAuthServiceServer
+}
+type CustomClaims struct {
+	Username string `json:"username"`
+	jwt.StandardClaims
+}
+
+func parseToken(tokenStr string) (*CustomClaims, error) {
+	token, err := jwt.ParseWithClaims(tokenStr, &CustomClaims{}, func(token *jwt.Token) (interface{}, error) {
+		return []byte("your-secret-key"), nil
+	})
+
+	if claims, ok := token.Claims.(*CustomClaims); ok && token.Valid {
+		return claims, nil
+	} else {
+		return nil, err
+	}
+}
+func (s *authService) DeliverTokenByRPC(ctx context.Context, req *pb.DeliverTokenReq) (*pb.DeliveryResp, error) {
+	token := "generated_token_for_" + req.UserId
+	return &pb.DeliveryResp{Token: token}, nil
+}
+
+func (s *authService) VerifyTokenByRPC(ctx context.Context, req *pb.VerifyTokenReq) (*pb.VerifyResp, error) {
+	valid := req.Token != "" && req.Token[:19] == "generated_token_for_"
+	return &pb.VerifyResp{Res: valid}, nil
+}
+
 func initCasbin() (*casbin.Enforcer, error) {
-	m, err := model.NewModelFromFile("model.conf")
+	enforcer, err := casbin.NewEnforcer("C:/Users/Lenovo/Desktop/b/douyin-shop/model.conf", "C:/Users/Lenovo/Desktop/b/douyin-shop/policy.csv")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to initialize CasBin: %v", err)
 	}
-
-	a := fileadapter.NewAdapter("policy.csv")
-	e, err := casbin.NewEnforcer(m, a)
-	if err != nil {
-		return nil, err
-	}
-
-	return e, nil
+	log.Println("CasBin initialized successfully")
+	return enforcer, nil
 }
 
-// 权限检查中间件
-func authMiddleware(e *casbin.Enforcer) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			sub := r.URL.Query().Get("user")
-			if sub == "" {
-				http.Error(w, "Unauthorized", http.StatusUnauthorized)
+func initAuthServiceClient() {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := grpc.DialContext(
+		ctx,
+		authServiceAddr,
+		grpc.WithInsecure(),
+		grpc.WithBlock(),
+	)
+	if err != nil {
+		log.Fatalf("连接gRPC服务失败: %v", err)
+	}
+	authServiceClient = pb.NewAuthServiceClient(conn)
+	log.Println("gRPC客户端初始化成功")
+}
+
+func verifyToken(token string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	resp, err := authServiceClient.VerifyTokenByRPC(ctx, &pb.VerifyTokenReq{Token: token})
+	if err != nil {
+		return false, err
+	}
+	return resp.Res, nil
+}
+
+func authMiddleware(e *casbin.Enforcer) app.HandlerFunc {
+	return func(c context.Context, ctx *app.RequestContext) {
+		token := ctx.Request.Header.Get("Authorization")
+		if token == "" {
+			ctx.JSON(http.StatusUnauthorized, map[string]string{"error": "Unauthorized"})
+			return
+		}
+
+		if len(token) > 7 && token[:7] == "Bearer " {
+			token = token[7:]
+		}
+
+		claims, err := parseToken(token)
+		if err != nil {
+			if err == jwt.ErrSignatureInvalid {
+				// Token无效的情况
+				ctx.JSON(http.StatusForbidden, map[string]string{"error": "禁止访问"})
 				return
 			}
-			obj := r.URL.Path
-			act := r.Method
 
-			if ok, err := e.Enforce(sub, obj, act); err != nil {
-				log.Printf("Enforce error: %v", err)
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				return
-			} else if !ok {
-				http.Error(w, "Forbidden", http.StatusForbidden)
-				return
-			}
+			// 其他类型错误视为服务器问题
+			log.Printf("Token解析错误: %v", err)
+			ctx.JSON(http.StatusInternalServerError, map[string]string{"error": "服务器内部错误"})
+			return
+		}
 
-			next.ServeHTTP(w, r)
-		})
+		sub := claims.Username // 或 sub := claims.Subject，根据你的JWT配置
+
+		if sub == "" {
+			ctx.JSON(http.StatusForbidden, map[string]string{"error": "令牌中缺少用户信息"})
+			return
+		}
+		obj := ctx.Request.URI().Path()
+		act := ctx.Request.Method()
+
+		if ok, err := e.Enforce(sub, obj, act); err != nil {
+			log.Printf("权限验证错误: %v", err)
+			ctx.JSON(http.StatusInternalServerError, map[string]string{"error": "服务器内部错误"})
+			return
+		} else if !ok {
+			ctx.JSON(http.StatusForbidden, map[string]string{"error": "禁止访问"})
+			return
+		}
+
+		ctx.Next(c)
 	}
 }
 
-func helloHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Hello, World!")
+func helloHandler(c context.Context, ctx *app.RequestContext) {
+	ctx.String(http.StatusOK, "Hello, World!")
 }
 
-func adminHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Fprintf(w, "Admin Page")
+func adminHandler(c context.Context, ctx *app.RequestContext) {
+	ctx.String(http.StatusOK, "Admin Page")
 }
 
 func registerService(consulClient *consulapi.Client, serviceName string, serviceID string, servicePort int) error {
@@ -76,41 +155,74 @@ func registerService(consulClient *consulapi.Client, serviceName string, service
 		},
 	}
 
-	return consulClient.Agent().ServiceRegister(registration)
+	err := consulClient.Agent().ServiceRegister(registration)
+	if err != nil {
+		return err
+	}
+	log.Println("服务已注册到Consul")
+	return nil
 }
 
+const (
+	authServiceAddr = "localhost:50051"
+)
+
+var authServiceClient pb.AuthServiceClient
+
 func main() {
-	// 创建 Consul 客户端
+	fmt.Println("启动服务...")
+
+	// 1. 先启动gRPC服务端
+	lis, err := net.Listen("tcp", ":50051")
+	if err != nil {
+		log.Fatalf("监听失败: %v", err)
+	}
+	grpcServer := grpc.NewServer()
+	pb.RegisterAuthServiceServer(grpcServer, &authService{})
+	reflection.Register(grpcServer)
+	go func() {
+		log.Printf("gRPC服务端正在监听 %s", lis.Addr().String())
+		if err := grpcServer.Serve(lis); err != nil {
+			log.Fatalf("gRPC服务启动失败: %v", err)
+		}
+	}()
+
+	// 2. 初始化gRPC客户端（带超时）
+	initAuthServiceClient()
+
+	// 3. 初始化Consul客户端
 	consulConfig := consulapi.DefaultConfig()
 	consulClient, err := consulapi.NewClient(consulConfig)
 	if err != nil {
-		log.Fatalf("Failed to create Consul client: %v", err)
+		log.Fatalf("创建Consul客户端失败: %v", err)
 	}
 
-	// 注册服务
+	// 4. 注册服务到Consul
 	serviceName := "my-service"
 	serviceID := "my-service-1"
 	servicePort := 8080
-
 	if err := registerService(consulClient, serviceName, serviceID, servicePort); err != nil {
-		log.Fatalf("Failed to register service: %v", err)
+		log.Fatalf("Consul服务注册失败: %v", err)
 	}
 
-	// 初始化 CasBin
+	// 5. 初始化CasBin
 	e, err := initCasbin()
 	if err != nil {
-		log.Fatalf("Failed to initialize CasBin: %v", err)
+		log.Fatalf("CasBin初始化失败: %v", err)
 	}
 
-	// 启动 HTTP 服务器
-	http.Handle("/hello", authMiddleware(e)(http.HandlerFunc(helloHandler)))
-	http.Handle("/admin", authMiddleware(e)(http.HandlerFunc(adminHandler)))
-	http.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "OK")
+	// 6. 配置Hertz服务器
+	h := server.Default(server.WithHostPorts(":8080"))
+	h.Use(authMiddleware(e)) // 添加鉴权中间件
+
+	// 7. 注册路由
+	h.GET("/hello", helloHandler)
+	h.GET("/admin", adminHandler)
+	h.GET("/health", func(c context.Context, ctx *app.RequestContext) {
+		ctx.String(http.StatusOK, "OK")
 	})
 
-	fmt.Println("Starting server at port 8080")
-	if err := http.ListenAndServe(":8080", nil); err != nil {
-		log.Fatalf("Failed to start server: %v", err)
-	}
+	log.Println("所有组件初始化完成")
+	log.Println("HTTP服务正在监听 :8080")
+	h.Spin()
 }
